@@ -4,11 +4,17 @@
 # (no clang2graph, no XLA, no python-bundled toolchain). Built up progressively,
 # one testable layer at a time. See LLVM21_MIGRATION_PLAN.md.
 #
-# Layers (add as each is verified):
-#   [x] proto        - generate + build the ProgramGraph protobufs   (this file)
+# Layers:
+#   [x] proto        - generate + build the ProgramGraph protobufs
 #   [x] graph base   - programl/graph/*.cc  (labm8 compat shim + absl)
-#   [ ] llvm builder - programl/ir/llvm/**  ported to LLVM 21
+#   [x] llvm builder - programl/ir/llvm/**  ported to LLVM 21   (opt-in)
 #   [ ] llvm2graph   - the binary: .ll/.bc -> ProgramGraph proto
+#
+# Build Layers 1-2 only (no LLVM):
+#   cmake -S . -B build && cmake --build build
+# Build the LLVM builder too (needs your LLVM 21):
+#   cmake -S . -B build -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm
+#   cmake --build build
 cmake_minimum_required(VERSION 3.20)
 project(programl_llvm21 LANGUAGES CXX)
 
@@ -21,12 +27,30 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 set(PROGRAML_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
+set(LABM8_COMPAT_INCLUDE ${PROGRAML_ROOT}/third_party/labm8_compat)
 
 # ---------------------------------------------------------------------------
-# Layer: protobuf  (proven to work under modern protobuf 5.x)
+# Optional LLVM (opt-in via -DLLVM_DIR). Detected FIRST so its RTTI setting can
+# be applied globally — protobuf generates different code under RTTI vs no-RTTI,
+# so every target must agree, or objects mismatch at link time.
 # ---------------------------------------------------------------------------
-# Prefer the CONFIG package modern protobuf ships (pulls its abseil deps);
-# fall back to the legacy FindProtobuf module.
+set(PROGRAML_HAVE_LLVM OFF)
+if(DEFINED LLVM_DIR OR PROGRAML_ENABLE_LLVM)
+  find_package(LLVM REQUIRED CONFIG)
+  message(STATUS "ProGraML: LLVM ${LLVM_PACKAGE_VERSION} "
+                 "(major=${LLVM_VERSION_MAJOR}, RTTI=${LLVM_ENABLE_RTTI})")
+  set(PROGRAML_HAVE_LLVM ON)
+  # Match LLVM's RTTI setting across ALL targets (default LLVM builds are no-RTTI;
+  # protobuf headers then need GOOGLE_PROTOBUF_NO_RTTI to avoid dynamic_cast).
+  if(NOT LLVM_ENABLE_RTTI)
+    add_compile_options(-fno-rtti)
+    add_compile_definitions(GOOGLE_PROTOBUF_NO_RTTI)
+  endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Layer: protobuf
+# ---------------------------------------------------------------------------
 find_package(protobuf CONFIG QUIET)
 if(protobuf_FOUND)
   set(PROTOBUF_LIB protobuf::libprotobuf)
@@ -40,15 +64,15 @@ endif()
 set(PROTO_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/gen)
 file(MAKE_DIRECTORY ${PROTO_GEN_DIR})
 
-# proto import paths are repo-root-relative (e.g. "programl/proto/..."),
-# so protoc's -I is the repo root and outputs mirror that layout under gen/.
+# import paths are repo-root-relative (e.g. "programl/proto/..."), so -I is the
+# repo root and outputs mirror that layout under gen/.
 set(PROTO_FILES
   programl/proto/program_graph.proto
   programl/proto/util.proto
   programl/third_party/tensorflow/features.proto)
 
 # Generate ALL protos in ONE protoc call so every .pb.h exists before any .pb.cc
-# is compiled (util.pb.cc #includes program_graph.pb.h — separate per-file custom
+# is compiled (util.pb.cc #includes program_graph.pb.h — separate per-file
 # commands would race under a parallel build).
 set(PROTO_SRCS "")
 set(PROTO_OUTS "")
@@ -72,17 +96,10 @@ add_library(programl_proto STATIC ${PROTO_SRCS})
 target_include_directories(programl_proto PUBLIC ${PROTO_GEN_DIR})
 target_link_libraries(programl_proto PUBLIC ${PROTOBUF_LIB})
 
-# Convenience: build just the proto layer with `cmake --build . --target programl_proto`.
-
 # ---------------------------------------------------------------------------
-# Layer: graph base  (programl/graph/*.cc — no LLVM, so locally buildable)
+# Layer: graph base  (programl/graph/*.cc — no LLVM)
 # ---------------------------------------------------------------------------
-# abseil (flat_hash_map/set used directly by the builder). Modern protobuf pulls
-# abseil transitively, but we request it explicitly for the container targets.
 find_package(absl CONFIG REQUIRED)
-
-# Our self-contained labm8 stand-in: adding this dir makes "labm8/cpp/*.h" resolve.
-set(LABM8_COMPAT_INCLUDE ${PROGRAML_ROOT}/third_party/labm8_compat)
 
 add_library(programl_graph STATIC
   programl/graph/program_graph_builder.cc
@@ -95,3 +112,29 @@ target_link_libraries(programl_graph PUBLIC
   programl_proto
   absl::flat_hash_map
   absl::flat_hash_set)
+
+# ---------------------------------------------------------------------------
+# Layer: LLVM builder  (programl/ir/llvm/** — ported to LLVM 21; opt-in)
+# ---------------------------------------------------------------------------
+if(PROGRAML_HAVE_LLVM)
+  add_library(programl_ir_llvm STATIC
+    programl/ir/llvm/llvm.cc
+    programl/ir/llvm/internal/program_graph_builder.cc
+    programl/ir/llvm/internal/text_encoder.cc
+    programl/ir/llvm/internal/program_graph_builder_pass.cc)
+  # PROGRAML_LLVM_VERSION_MAJOR drives the #if version forks in the sources.
+  target_compile_definitions(programl_ir_llvm PRIVATE
+    PROGRAML_LLVM_VERSION_MAJOR=${LLVM_VERSION_MAJOR})
+  separate_arguments(LLVM_DEFS NATIVE_COMMAND "${LLVM_DEFINITIONS}")
+  target_compile_options(programl_ir_llvm PRIVATE ${LLVM_DEFS})
+  target_include_directories(programl_ir_llvm PUBLIC
+    ${PROGRAML_ROOT}
+    ${LABM8_COMPAT_INCLUDE}
+    ${PROTO_GEN_DIR}
+    ${LLVM_INCLUDE_DIRS})
+  llvm_map_components_to_libnames(LLVM_LIBS core irreader support)
+  target_link_libraries(programl_ir_llvm PUBLIC
+    programl_graph
+    programl_proto
+    ${LLVM_LIBS})
+endif()

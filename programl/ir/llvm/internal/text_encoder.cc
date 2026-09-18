@@ -48,12 +48,20 @@ string PrintToString(const T& value) {
 // dereferencing.
 const ::llvm::Type* GetDereferencedType(const ::llvm::Type* type, int* pointerDepth) {
   CHECK(type) << "nullptr type at pointer depth " << *pointerDepth;
+#if PROGRAML_LLVM_VERSION_MAJOR >= 15
+  // Opaque pointers (LLVM 15+): a pointer carries no pointee type, so we cannot
+  // dereference to a base type. Treat the pointer itself as the base — the
+  // "struct*" special-casing no longer applies and such types print normally
+  // (e.g. "ptr"). pointerDepth stays 0.
+  return type;
+#else
   if (type->isPointerTy()) {
     *pointerDepth = *pointerDepth + 1;
     return GetDereferencedType(type->getPointerElementType(), pointerDepth);
   } else {
     return type;
   }
+#endif
 }
 
 // Specialization for LLVM types which returns "struct" or "struct*" for

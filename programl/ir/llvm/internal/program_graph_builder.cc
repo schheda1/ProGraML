@@ -304,8 +304,10 @@ Node* ProgramGraphBuilder::AddLlvmInstruction(const ::llvm::Instruction* instruc
   node->set_block(blockCount_);
   graph::AddScalarFeature(node, "full_text", text.text);
 
-#if PROGRAML_LLVM_VERSION_MAJOR > 3
-  // Add profiling information features, if available.
+#if PROGRAML_LLVM_VERSION_MAJOR > 3 && PROGRAML_LLVM_VERSION_MAJOR < 16
+  // Add profiling information features, if available. Disabled for LLVM >= 16:
+  // extractProfMetadata / getEntryCount's Optional API changed and these
+  // features are not used by the task (safe to omit).
   uint64_t profTotalWeight;
   if (instruction->extractProfTotalWeight(profTotalWeight)) {
     graph::AddScalarFeature(node, "llvm_profile_total_weight", profTotalWeight);
@@ -413,6 +415,15 @@ Node* ProgramGraphBuilder::AddLlvmType(const ::llvm::PointerType* type) {
   Node* node = AddType("*");
   graph::AddScalarFeature(node, "full_text", textEncoder_.Encode(type).text);
 
+#if PROGRAML_LLVM_VERSION_MAJOR >= 15
+  // Opaque pointers (LLVM 15+): a PointerType no longer carries a pointee type
+  // (PointerType::getElementType() is removed), so there is no element type to
+  // recurse into — the pointer node stands alone (its full_text is "ptr").
+  // Element-type information, where it matters for the task, lives on the typed
+  // memory operations (load/store) rather than on the pointer type. See
+  // LLVM21_MIGRATION_PLAN.md (opaque-pointer representational note).
+  (void)type;
+#else
   auto elementType = type->getElementType();
   auto parent = compositeTypeParts_.find(elementType);
   if (parent == compositeTypeParts_.end()) {
@@ -423,6 +434,7 @@ Node* ProgramGraphBuilder::AddLlvmType(const ::llvm::PointerType* type) {
     // Bottom-out for self-referencing types.
     CHECK(AddTypeEdge(/*position=*/0, parent->second, node).ok());
   }
+#endif
 
   return node;
 }
@@ -470,15 +482,24 @@ labm8::StatusOr<ProgramGraph> ProgramGraphBuilder::Build(const ::llvm::Module& m
 
   Module* moduleMessage = AddModule(getModuleName(module));
 
+#if PROGRAML_LLVM_VERSION_MAJOR >= 21
+  // LLVM 21: Module::getTargetTriple() returns a llvm::Triple, not std::string.
+  graph::AddScalarFeature(moduleMessage, "llvm_target_triple", module.getTargetTriple().str());
+#else
   graph::AddScalarFeature(moduleMessage, "llvm_target_triple", module.getTargetTriple());
+#endif
   graph::AddScalarFeature(moduleMessage, "llvm_data_layout", module.getDataLayoutStr());
 
   for (const ::llvm::Function& function : module) {
     // Create the function message.
-    Function* functionMessage = AddFunction(function.getName(), moduleMessage);
+    // getName() returns a StringRef; .str() is required since StringRef->string
+    // became explicit (LLVM 16) and is passed here by value. .str() works on all
+    // versions.
+    Function* functionMessage = AddFunction(function.getName().str(), moduleMessage);
 
-#if PROGRAML_LLVM_VERSION_MAJOR > 6
-    // Add profiling information, if available.
+#if PROGRAML_LLVM_VERSION_MAJOR > 6 && PROGRAML_LLVM_VERSION_MAJOR < 16
+    // Add profiling information, if available. (Disabled for LLVM >= 16 — the
+    // Optional getEntryCount() API changed; unused by the task.)
     if (function.hasProfileData()) {
       auto profileCount = function.getEntryCount();
       Feature feature;
@@ -486,7 +507,7 @@ labm8::StatusOr<ProgramGraph> ProgramGraphBuilder::Build(const ::llvm::Module& m
       functionMessage->mutable_features()->mutable_feature()->insert(
           {"llvm_profile_entry_count", feature});
     }
-#elif PROGRAML_LLVM_VERSION_MAJOR > 3
+#elif PROGRAML_LLVM_VERSION_MAJOR > 3 && PROGRAML_LLVM_VERSION_MAJOR < 16
     // Add profiling information, if available.
     if (function.hasProfileData()) {
       auto profileCount = function.getEntryCount();
@@ -531,8 +552,9 @@ labm8::StatusOr<ProgramGraph> ProgramGraphBuilder::Build(const ::llvm::Module& m
     }
   }
 
-#if PROGRAML_LLVM_VERSION_MAJOR > 3
-  // Add profiling information, if available.
+#if PROGRAML_LLVM_VERSION_MAJOR > 3 && PROGRAML_LLVM_VERSION_MAJOR < 16
+  // Add profiling information, if available. (Disabled for LLVM >= 16 — unused
+  // by the task; re-enable if profiling features are wanted.)
   ::llvm::Metadata* profileMetadata = module.getModuleFlag("ProfileSummary");
   if (profileMetadata) {
     ::llvm::ProfileSummary* profileSummary = ::llvm::ProfileSummary::getFromMD(profileMetadata);

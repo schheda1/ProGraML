@@ -19,7 +19,10 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Support/SourceMgr.h"
+#if PROGRAML_LLVM_VERSION_MAJOR < 16
+// PassManagerBuilder (the legacy opt-pipeline populator) was removed in LLVM 16.
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#endif
 #include "programl/ir/llvm/internal/program_graph_builder_pass.h"
 #include "programl/proto/program_graph.pb.h"
 
@@ -32,9 +35,15 @@ namespace llvm {
 Status BuildProgramGraph(::llvm::Module& module, ProgramGraph* graph,
                          const ProgramGraphOptions& options) {
   ::llvm::legacy::PassManager passManager;
+#if PROGRAML_LLVM_VERSION_MAJOR < 16
+  // Populate the module pass manager with standard opt passes at OptLevel. On
+  // LLVM >= 16 PassManagerBuilder is gone; we run only the graph-builder pass
+  // (opt_level is not applied — graphs are built from the IR as given, which is
+  // what we want for this pipeline).
   ::llvm::PassManagerBuilder passManagerBuilder;
   passManagerBuilder.OptLevel = options.opt_level();
   passManagerBuilder.populateModulePassManager(passManager);
+#endif
 
   // Create a graph builder pass. Ownership of this pointer is transferred to
   // legacy::PassManager on add().
