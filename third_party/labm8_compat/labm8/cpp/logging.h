@@ -42,6 +42,16 @@ struct Voidify {
 
 }  // namespace labm8_log
 
+// Modern protobuf depends on abseil, which defines its own LOG/CHECK/DCHECK
+// macros (absl/log/log.h, absl/log/check.h) and may be included before this
+// header. Undef first so the labm8-compatible definitions below are authoritative
+// (they are behavior-equivalent to absl's for our usage) and no "macro redefined"
+// warning is emitted. absl's own internals use ABSL_LOG/ABSL_CHECK, not the public
+// macros, so overriding the public ones is safe here.
+#undef LOG
+#undef CHECK
+#undef DCHECK
+
 #define LABM8_LOG_FATAL ::labm8_log::LogMessage(true).stream()
 #define LABM8_LOG_ERROR ::labm8_log::LogMessage(false).stream()
 #define LABM8_LOG_WARNING ::labm8_log::LogMessage(false).stream()
